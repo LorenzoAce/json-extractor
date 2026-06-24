@@ -1,4 +1,4 @@
-import { type ReactNode, useMemo, useRef, useState } from 'react'
+import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react'
 import {
   BarElement,
   CategoryScale,
@@ -12,12 +12,19 @@ import {
   ArrowDownUp,
   BarChart3,
   CircleAlert,
+  Database,
   Download,
   FileJson2,
   Filter,
+  FolderOpen,
+  LoaderCircle,
+  PencilLine,
   PieChart,
+  Save,
   Search,
+  Trash2,
   Wallet,
+  X,
 } from 'lucide-react'
 import { Bar, Doughnut } from 'react-chartjs-2'
 import {
@@ -30,6 +37,15 @@ import {
   type PaginationState,
   type SortingState,
 } from '@tanstack/react-table'
+import {
+  createSavedAnalysis,
+  deleteSavedAnalysis,
+  fetchSavedAnalyses,
+  fetchSavedAnalysis,
+  updateSavedAnalysis,
+  type ArchiveSummary,
+  type SavedAnalysisListItem,
+} from './lib/archive-api'
 import { cn } from './lib/utils'
 
 ChartJS.register(
@@ -65,6 +81,7 @@ type ParsedOperation = {
 
 type FieldKind = 'date' | 'amount' | 'description' | 'id' | 'status'
 type InferredFieldMap = Partial<Record<FieldKind, string>>
+type AnalysisSummary = ArchiveSummary
 
 const TYPE_RULES: Array<{ match: string; type: OperationType }> = [
   { match: 'carta di credito', type: 'Carta di credito' },
@@ -551,11 +568,80 @@ function buildExcelSheetStyles(
   }
 }
 
+function createEmptySummary(): AnalysisSummary {
+  return {
+    totalOperations: 0,
+    totalAmount: 0,
+    totalsByType: TYPE_LABELS.reduce<Record<string, number>>((accumulator, type) => {
+      accumulator[type] = 0
+      return accumulator
+    }, {}),
+  }
+}
+
+function buildSummaryFromOperations(operations: ParsedOperation[]): AnalysisSummary {
+  const summary = createEmptySummary()
+  summary.totalOperations = operations.length
+
+  for (const operation of operations) {
+    summary.totalAmount += operation.amount
+    summary.totalsByType[operation.type] =
+      (summary.totalsByType[operation.type] ?? 0) + operation.amount
+  }
+
+  return summary
+}
+
+function analyzeJsonInput(input: string) {
+  if (!input.trim()) {
+    throw new Error('Incolla un JSON prima di avviare l’analisi.')
+  }
+
+  const rawOperations = extractOperationsArray(input).filter((item) =>
+    isPlainObject(item),
+  ) as Record<string, unknown>[]
+
+  const inferredMap = inferFieldMap(rawOperations)
+
+  const parsedOperations = rawOperations
+    .map((item) => {
+      const flatRecord = flattenRecord(item)
+      const description = resolveOperationDescription(flatRecord, inferredMap)
+      const requestDate = resolveOperationDate(flatRecord, inferredMap)
+      const timestamp = parseTimestamp(requestDate)
+
+      return {
+        requestDate,
+        amount: resolveOperationAmount(flatRecord, inferredMap),
+        description,
+        id: resolveOperationId(flatRecord, inferredMap),
+        status: resolveOperationStatus(flatRecord, inferredMap),
+        type: classifyDescription(description),
+        timestamp,
+        dayLabel: timestamp > 0 ? dateFormatter.format(timestamp) : 'Senza data',
+      } satisfies ParsedOperation
+    })
+    .sort((first, second) => second.timestamp - first.timestamp)
+
+  if (parsedOperations.length === 0) {
+    throw new Error('Nessuna operazione trovata.')
+  }
+
+  return parsedOperations
+}
+
 function App() {
   const [jsonInput, setJsonInput] = useState('')
   const [operations, setOperations] = useState<ParsedOperation[]>([])
   const [errorMessage, setErrorMessage] = useState('')
   const [successMessage, setSuccessMessage] = useState('')
+  const [archiveError, setArchiveError] = useState('')
+  const [archiveOpen, setArchiveOpen] = useState(false)
+  const [analysisName, setAnalysisName] = useState('')
+  const [savedAnalyses, setSavedAnalyses] = useState<SavedAnalysisListItem[]>([])
+  const [selectedAnalysisId, setSelectedAnalysisId] = useState<string | null>(null)
+  const [archiveLoading, setArchiveLoading] = useState(false)
+  const [archiveSaving, setArchiveSaving] = useState(false)
   const [searchTerm, setSearchTerm] = useState('')
   const [typeFilter, setTypeFilter] = useState<'Tutti' | OperationType>('Tutti')
   const resultsRef = useRef<HTMLDivElement | null>(null)
@@ -591,28 +677,7 @@ function App() {
     })
   }, [operations, searchTerm, typeFilter])
 
-  const totalsByType = useMemo(() => {
-    return TYPE_LABELS.reduce<Record<OperationType, number>>((accumulator, type) => {
-      accumulator[type] = 0
-      return accumulator
-    }, {} as Record<OperationType, number>)
-  }, [])
-
-  const summary = useMemo(() => {
-    const baseTotals = { ...totalsByType }
-    let totalAmount = 0
-
-    for (const operation of operations) {
-      totalAmount += operation.amount
-      baseTotals[operation.type] += operation.amount
-    }
-
-    return {
-      totalOperations: operations.length,
-      totalAmount,
-      totalsByType: baseTotals,
-    }
-  }, [operations, totalsByType])
+  const summary = useMemo(() => buildSummaryFromOperations(operations), [operations])
 
   const pieChartData = useMemo(() => {
     const labels = TYPE_LABELS.filter((type) => summary.totalsByType[type] > 0)
@@ -769,58 +834,180 @@ function App() {
     getPaginationRowModel: getPaginationRowModel(),
   })
 
-  function handleAnalyze() {
+  function applyAnalysisResult(parsedOperations: ParsedOperation[], rawInput: string, message: string) {
+    setJsonInput(rawInput)
+    setOperations(parsedOperations)
     setErrorMessage('')
-    setSuccessMessage('')
+    setSuccessMessage(message)
+    setArchiveError('')
     setPagination((current) => ({ ...current, pageIndex: 0 }))
 
+    requestAnimationFrame(() => {
+      resultsRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    })
+  }
+
+  async function refreshSavedArchive() {
+    setArchiveLoading(true)
+    setArchiveError('')
+
     try {
-      if (!jsonInput.trim()) {
-        setOperations([])
-        setErrorMessage('Incolla un JSON prima di avviare l’analisi.')
-        return
-      }
+      const items = await fetchSavedAnalyses()
+      setSavedAnalyses(items)
+    } catch (error) {
+      setArchiveError(error instanceof Error ? error.message : 'Errore caricamento archivio.')
+    } finally {
+      setArchiveLoading(false)
+    }
+  }
 
-      const rawOperations = extractOperationsArray(jsonInput).filter((item) =>
-        isPlainObject(item),
-      ) as Record<string, unknown>[]
+  useEffect(() => {
+    void refreshSavedArchive()
+  }, [])
 
-      const inferredMap = inferFieldMap(rawOperations)
-
-      const parsedOperations = rawOperations
-        .map((item) => {
-          const flatRecord = flattenRecord(item)
-          const description = resolveOperationDescription(flatRecord, inferredMap)
-          const requestDate = resolveOperationDate(flatRecord, inferredMap)
-          const timestamp = parseTimestamp(requestDate)
-
-          return {
-            requestDate,
-            amount: resolveOperationAmount(flatRecord, inferredMap),
-            description,
-            id: resolveOperationId(flatRecord, inferredMap),
-            status: resolveOperationStatus(flatRecord, inferredMap),
-            type: classifyDescription(description),
-            timestamp,
-            dayLabel: timestamp > 0 ? dateFormatter.format(timestamp) : 'Senza data',
-          } satisfies ParsedOperation
-        })
-        .sort((first, second) => second.timestamp - first.timestamp)
-
-      if (parsedOperations.length === 0) {
-        setOperations([])
-        setErrorMessage('Nessuna operazione trovata.')
-        return
-      }
-
-      setOperations(parsedOperations)
-      setSuccessMessage(`Analisi completata: ${parsedOperations.length} operazioni trovate.`)
-      requestAnimationFrame(() => {
-        resultsRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
-      })
-    } catch {
+  function handleAnalyze() {
+    try {
+      const parsedOperations = analyzeJsonInput(jsonInput)
+      applyAnalysisResult(
+        parsedOperations,
+        jsonInput,
+        `Analisi completata: ${parsedOperations.length} operazioni trovate.`,
+      )
+    } catch (error) {
       setOperations([])
-      setErrorMessage('JSON non valido. Verifica i dati inseriti.')
+      setSuccessMessage('')
+      setErrorMessage(
+        error instanceof Error ? error.message : 'JSON non valido. Verifica i dati inseriti.',
+      )
+    }
+  }
+
+  async function handleCreateAnalysis() {
+    setArchiveSaving(true)
+    setArchiveError('')
+
+    try {
+      const parsedOperations =
+        operations.length > 0 && jsonInput.trim() ? operations : analyzeJsonInput(jsonInput)
+      const nextName = analysisName.trim() || `Analisi ${new Date().toLocaleString('it-IT')}`
+
+      const response = await createSavedAnalysis({
+        name: nextName,
+        rawJson: jsonInput,
+        operations: parsedOperations,
+        summary: buildSummaryFromOperations(parsedOperations),
+      })
+
+      setSelectedAnalysisId(response.id)
+      setAnalysisName(nextName)
+      setSuccessMessage(`Analisi salvata in archivio come "${nextName}".`)
+      await refreshSavedArchive()
+    } catch (error) {
+      setArchiveError(error instanceof Error ? error.message : 'Errore salvataggio archivio.')
+    } finally {
+      setArchiveSaving(false)
+    }
+  }
+
+  async function handleUpdateAnalysis() {
+    if (!selectedAnalysisId) {
+      setArchiveError('Seleziona prima un elemento dell’archivio da aggiornare.')
+      return
+    }
+
+    setArchiveSaving(true)
+    setArchiveError('')
+
+    try {
+      const parsedOperations =
+        operations.length > 0 && jsonInput.trim() ? operations : analyzeJsonInput(jsonInput)
+      const nextName = analysisName.trim() || `Analisi ${new Date().toLocaleString('it-IT')}`
+
+      await updateSavedAnalysis(selectedAnalysisId, {
+        name: nextName,
+        rawJson: jsonInput,
+        operations: parsedOperations,
+        summary: buildSummaryFromOperations(parsedOperations),
+      })
+
+      setSuccessMessage(`Analisi aggiornata in archivio: "${nextName}".`)
+      await refreshSavedArchive()
+    } catch (error) {
+      setArchiveError(error instanceof Error ? error.message : 'Errore aggiornamento archivio.')
+    } finally {
+      setArchiveSaving(false)
+    }
+  }
+
+  async function handleLoadAnalysis(id: string) {
+    setArchiveLoading(true)
+    setArchiveError('')
+
+    try {
+      const item = await fetchSavedAnalysis(id)
+      const parsedOperations = analyzeJsonInput(item.rawJson)
+      setSelectedAnalysisId(item.id)
+      setAnalysisName(item.name)
+      applyAnalysisResult(
+        parsedOperations,
+        item.rawJson,
+        `Analisi caricata da archivio: "${item.name}".`,
+      )
+      setArchiveOpen(false)
+    } catch (error) {
+      setArchiveError(error instanceof Error ? error.message : 'Errore caricamento analisi.')
+    } finally {
+      setArchiveLoading(false)
+    }
+  }
+
+  async function handleRenameAnalysis(id: string, currentName: string) {
+    const newName = window.prompt('Nuovo nome analisi', currentName)?.trim()
+
+    if (!newName || newName === currentName) {
+      return
+    }
+
+    setArchiveSaving(true)
+    setArchiveError('')
+
+    try {
+      await updateSavedAnalysis(id, { name: newName })
+
+      if (selectedAnalysisId === id) {
+        setAnalysisName(newName)
+      }
+
+      setSuccessMessage(`Analisi rinominata in "${newName}".`)
+      await refreshSavedArchive()
+    } catch (error) {
+      setArchiveError(error instanceof Error ? error.message : 'Errore rinomina analisi.')
+    } finally {
+      setArchiveSaving(false)
+    }
+  }
+
+  async function handleDeleteAnalysis(id: string, name: string) {
+    if (!window.confirm(`Eliminare l'analisi "${name}"?`)) {
+      return
+    }
+
+    setArchiveSaving(true)
+    setArchiveError('')
+
+    try {
+      await deleteSavedAnalysis(id)
+
+      if (selectedAnalysisId === id) {
+        setSelectedAnalysisId(null)
+      }
+
+      setSuccessMessage(`Analisi eliminata: "${name}".`)
+      await refreshSavedArchive()
+    } catch (error) {
+      setArchiveError(error instanceof Error ? error.message : 'Errore eliminazione analisi.')
+    } finally {
+      setArchiveSaving(false)
     }
   }
 
@@ -916,10 +1103,20 @@ function App() {
               </div>
             </div>
 
-            <div className="grid w-full gap-3 sm:grid-cols-3 lg:w-auto">
-              <FeaturePill icon={Wallet} title="Totali" subtitle="Riepilogo automatico" />
-              <FeaturePill icon={PieChart} title="Grafici" subtitle="Distribuzione e trend" />
-              <FeaturePill icon={Download} title="Excel" subtitle="Export formattato" />
+            <div className="flex w-full flex-col gap-3 lg:w-auto">
+              <button
+                type="button"
+                onClick={() => setArchiveOpen(true)}
+                className={cnButton('bg-slate-900 px-5 text-white hover:bg-slate-800')}
+              >
+                <Database className="h-4 w-4" />
+                APRI ARCHIVIO JSON
+              </button>
+              <div className="grid gap-3 sm:grid-cols-3">
+                <FeaturePill icon={Wallet} title="Totali" subtitle="Riepilogo automatico" />
+                <FeaturePill icon={PieChart} title="Grafici" subtitle="Distribuzione e trend" />
+                <FeaturePill icon={Download} title="Excel" subtitle="Export formattato" />
+              </div>
             </div>
           </div>
         </section>
@@ -944,6 +1141,36 @@ function App() {
               placeholder="Incolla qui la stringa JSON restituita dalle API..."
               className="min-h-[280px] w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-4 text-sm leading-6 text-slate-800 outline-none transition placeholder:text-slate-400 focus:border-blue-400 focus:bg-white focus:ring-4 focus:ring-blue-100"
             />
+
+            <div className="mt-4 grid gap-3 lg:grid-cols-[1fr_auto_auto]">
+              <input
+                value={analysisName}
+                onChange={(event) => setAnalysisName(event.target.value)}
+                placeholder="Nome analisi da salvare"
+                className="rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-800 outline-none transition focus:border-blue-400 focus:ring-4 focus:ring-blue-100"
+              />
+              <button
+                type="button"
+                onClick={() => void handleCreateAnalysis()}
+                disabled={archiveSaving || !jsonInput.trim()}
+                className={cnButton('bg-white text-slate-700')}
+              >
+                {archiveSaving ? (
+                  <LoaderCircle className="h-4 w-4 animate-spin" />
+                ) : (
+                  <Save className="h-4 w-4" />
+                )}
+                SALVA SU NEON
+              </button>
+              <button
+                type="button"
+                onClick={() => setArchiveOpen(true)}
+                className={cnButton('bg-white text-slate-700')}
+              >
+                <FolderOpen className="h-4 w-4" />
+                GESTISCI ARCHIVIO
+              </button>
+            </div>
 
             <div className="mt-4 flex flex-col gap-3 sm:flex-row">
               <button
@@ -982,6 +1209,13 @@ function App() {
                 tipologia e ordinamento iniziale per data decrescente.
               </div>
             )}
+
+            {archiveError ? (
+              <div className="mt-4 flex items-start gap-3 rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800">
+                <CircleAlert className="mt-0.5 h-4 w-4 shrink-0" />
+                <span>{archiveError}</span>
+              </div>
+            ) : null}
           </SurfaceCard>
 
           <SurfaceCard>
@@ -1245,6 +1479,159 @@ function App() {
           </div>
         </SurfaceCard>
       </div>
+
+      {archiveOpen ? (
+        <div className="fixed inset-0 z-50 flex justify-end bg-slate-950/30 backdrop-blur-sm">
+          <button
+            type="button"
+            aria-label="Chiudi archivio"
+            className="flex-1 cursor-default"
+            onClick={() => setArchiveOpen(false)}
+          />
+          <aside className="flex h-full w-full max-w-xl flex-col border-l border-slate-200 bg-white shadow-2xl">
+            <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
+              <div>
+                <h2 className="text-lg font-semibold text-slate-950">Archivio JSON</h2>
+                <p className="text-sm text-slate-500">
+                  Salva, carica, rinomina e cancella le analisi archiviate su Neon.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setArchiveOpen(false)}
+                className={cnButton('px-3 py-2 text-slate-700')}
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            <div className="border-b border-slate-200 px-5 py-4">
+              <div className="grid gap-3">
+                <input
+                  value={analysisName}
+                  onChange={(event) => setAnalysisName(event.target.value)}
+                  placeholder="Nome analisi"
+                  className="rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-800 outline-none transition focus:border-blue-400 focus:ring-4 focus:ring-blue-100"
+                />
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <button
+                    type="button"
+                    onClick={() => void handleCreateAnalysis()}
+                    disabled={archiveSaving || !jsonInput.trim()}
+                    className={cnButton('bg-slate-900 text-white hover:bg-slate-800')}
+                  >
+                    {archiveSaving ? (
+                      <LoaderCircle className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <Save className="h-4 w-4" />
+                    )}
+                    Salva nuova
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void handleUpdateAnalysis()}
+                    disabled={archiveSaving || !selectedAnalysisId || !jsonInput.trim()}
+                    className={cnButton('bg-white text-slate-700')}
+                  >
+                    <PencilLine className="h-4 w-4" />
+                    Aggiorna selezionata
+                  </button>
+                </div>
+              </div>
+
+              <div className="mt-3 flex items-center justify-between text-xs text-slate-500">
+                <span>{savedAnalyses.length} analisi salvate</span>
+                <button
+                  type="button"
+                  onClick={() => void refreshSavedArchive()}
+                  className="font-semibold text-blue-700"
+                >
+                  Aggiorna elenco
+                </button>
+              </div>
+
+              {archiveError ? (
+                <div className="mt-3 rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800">
+                  {archiveError}
+                </div>
+              ) : null}
+            </div>
+
+            <div className="flex-1 overflow-y-auto px-5 py-4">
+              {archiveLoading ? (
+                <div className="flex items-center gap-2 text-sm text-slate-500">
+                  <LoaderCircle className="h-4 w-4 animate-spin" />
+                  Caricamento archivio...
+                </div>
+              ) : savedAnalyses.length === 0 ? (
+                <div className="rounded-2xl border border-dashed border-slate-300 bg-slate-50 px-4 py-6 text-sm text-slate-500">
+                  Nessuna analisi salvata nel database.
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {savedAnalyses.map((item) => (
+                    <div
+                      key={item.id}
+                      className={cn(
+                        'rounded-2xl border px-4 py-4 transition',
+                        selectedAnalysisId === item.id
+                          ? 'border-blue-300 bg-blue-50/70'
+                          : 'border-slate-200 bg-white',
+                      )}
+                    >
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <p className="truncate text-sm font-semibold text-slate-900">
+                            {item.name}
+                          </p>
+                          <p className="mt-1 text-xs text-slate-500">
+                            {item.operationCount} operazioni · {formatCurrency(item.totalAmount)}
+                          </p>
+                          <p className="mt-1 text-xs text-slate-400">
+                            Aggiornata il {new Date(item.updatedAt).toLocaleString('it-IT')}
+                          </p>
+                        </div>
+                        {selectedAnalysisId === item.id ? (
+                          <span className="rounded-full bg-blue-600 px-2.5 py-1 text-[11px] font-semibold text-white">
+                            Selezionata
+                          </span>
+                        ) : null}
+                      </div>
+
+                      <div className="mt-4 flex flex-wrap gap-2">
+                        <button
+                          type="button"
+                          onClick={() => void handleLoadAnalysis(item.id)}
+                          className={cnButton('px-3 py-2 text-slate-700')}
+                        >
+                          <FolderOpen className="h-4 w-4" />
+                          Carica
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => void handleRenameAnalysis(item.id, item.name)}
+                          className={cnButton('px-3 py-2 text-slate-700')}
+                        >
+                          <PencilLine className="h-4 w-4" />
+                          Rinomina
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => void handleDeleteAnalysis(item.id, item.name)}
+                          className={cnButton('border-rose-200 bg-rose-50 px-3 py-2 text-rose-700 hover:border-rose-300 hover:bg-rose-100')}
+                        >
+                          <Trash2 className="h-4 w-4" />
+                          Elimina
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </aside>
+        </div>
+      ) : null}
     </main>
   )
 }

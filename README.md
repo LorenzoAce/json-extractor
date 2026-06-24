@@ -1,32 +1,70 @@
-# React + TypeScript + Vite
+# Estrattore Dati JSON
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+Dashboard React + Vite per:
 
-Currently, two official plugins are available:
+- analizzare JSON eterogenei
+- visualizzare tabella, totali e grafici
+- esportare Excel formattati
+- salvare e gestire le analisi su Neon PostgreSQL
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+## Stack
 
-## React Compiler
+- React + Vite + TypeScript
+- Tailwind CSS
+- TanStack Table
+- Chart.js
+- `xlsx-js-style`
+- Express + Neon PostgreSQL
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+## Ambiente
 
-## Expanding the Oxlint configuration
+Copia `.env.example` in `.env` e configura:
 
-If you are developing a production application, we recommend enabling type-aware lint rules by installing `oxlint-tsgolint` and editing `.oxlintrc.json`:
-
-```json
-{
-  "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["react", "typescript", "oxc"],
-  "options": {
-    "typeAware": true
-  },
-  "rules": {
-    "react/rules-of-hooks": "error",
-    "react/only-export-components": ["warn", { "allowConstantExport": true }]
-  }
-}
+```bash
+DATABASE_URL=postgresql://...
+API_PORT=3001
 ```
 
-See the [Oxlint rules documentation](https://oxc.rs/docs/guide/usage/linter/rules) for the full list of rules and categories.
+## Avvio
+
+Installa le dipendenze:
+
+```bash
+npm install
+```
+
+Avvia frontend e API insieme:
+
+```bash
+npm run dev
+```
+
+Avvia solo API:
+
+```bash
+npm run server
+```
+
+Build frontend:
+
+```bash
+npm run build
+```
+
+## Archivio JSON
+
+Le analisi vengono salvate nella tabella `saved_analyses` su Neon con:
+
+- nome analisi
+- JSON originale
+- operazioni parse
+- riepilogo aggregato
+- date di creazione e aggiornamento
+
+L'interfaccia consente di:
+
+- salvare una nuova analisi
+- aggiornare una analisi esistente
+- caricare una analisi salvata
+- rinominare una analisi
+- eliminare una analisi
